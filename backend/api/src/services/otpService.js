@@ -318,6 +318,10 @@ export async function markOtpVerified(otpId) {
 /**
  * Increments the attempt counter for an OTP record.
  * Used to lock out after MAX_ATTEMPTS_PER_PHONE failed verifications.
+ *
+ * Performs an atomic increment using the Postgres RPC `increment_otp_attempts`
+ * if available, eliminating race conditions. If the RPC is not available,
+ * falls back to reading the current integer attempt count and updating it.
  * 
  * @param {string} otpId - The OTP record ID
  * @returns {Promise<number>} New attempt count
@@ -326,9 +330,33 @@ export async function incrementOtpAttempts(otpId) {
   if (!supabaseAdmin || !otpId) return 0;
 
   try {
+    // 1. Try atomic increment via Postgres RPC function if available
+    if (typeof supabaseAdmin.rpc === 'function') {
+      const { data: rpcAttempts, error: rpcError } = await supabaseAdmin
+        .rpc('increment_otp_attempts', { p_otp_id: otpId });
+
+      if (!rpcError && typeof rpcAttempts === 'number') {
+        return rpcAttempts;
+      }
+    }
+
+    // 2. Fallback: Fetch current attempt count and update with numeric increment
+    const { data: current, error: fetchError } = await supabaseAdmin
+      .from('phone_otps')
+      .select('attempts')
+      .eq('id', otpId)
+      .single();
+
+    if (fetchError || !current) {
+      logger.error({ err: fetchError, otpId }, 'Failed to fetch OTP attempts');
+      return 0;
+    }
+
+    const nextAttempts = (Number.isFinite(current.attempts) ? current.attempts : 0) + 1;
+
     const { data, error } = await supabaseAdmin
       .from('phone_otps')
-      .update({ attempts: supabaseAdmin.rpc ? 'attempts + 1' : 1 })
+      .update({ attempts: nextAttempts })
       .eq('id', otpId)
       .select('attempts')
       .single();
@@ -338,7 +366,7 @@ export async function incrementOtpAttempts(otpId) {
       return 0;
     }
 
-    return data?.attempts || 0;
+    return data?.attempts ?? nextAttempts;
   } catch (err) {
     logger.error({ err, otpId }, 'Error incrementing OTP attempts');
     return 0;
